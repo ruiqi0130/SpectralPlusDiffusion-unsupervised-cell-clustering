@@ -1,0 +1,253 @@
+---
+title: "SpectralPlusDiffusion"
+subtitle: "Course Project for Math322"
+author: "Ruiqi Li ruiqi.li@yale.edu"
+date: "12/14/2022"
+output: pdf_document
+---
+# Package
+```{r}
+library(dirmult)
+library(splatter)
+library(scater)
+library(cluster)
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(aricode)
+library(foreach)
+library(doParallel)
+```
+
+# Function
+```{r}
+source("./SPD_func.R")
+```
+
+# Simulation Data
+```{r}
+params <- newSplatParams()
+nGroups = 9
+set.seed(100)
+group.prob = as.numeric(rdirichlet(n=1, alpha = rep(1,nGroups)))
+params <- setParams(params, update = list(
+  mean.rate = 0.3,
+  mean.shape = 0.6,
+  lib.loc = 11,
+  lib.scale = 0.2,
+  lib.norm = FALSE,
+  out.prob = 0.05,
+  out.facLoc = 4,
+  out.facScale = 0.5,
+  group.prob = group.prob,
+  nGenes = 13714, 
+  batchCells = 2638))
+
+seurat_obj <- splatSimulate(params, method = "group")
+seurat_obj <- logNormCounts(seurat_obj)
+seurat_obj <- as.Seurat(seurat_obj, counts = "counts")
+seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_obj <- ScaleData(seurat_obj, features = rownames(seurat_obj))
+seurat_obj <- RunPCA(seurat_obj, features = rownames(seurat_obj))
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:15)
+seurat_obj[["external_label"]] = seurat_obj$Group
+```
+
+# Real data (pbmc3k)
+```{r}
+# SeuratData::InstallData("pbmc3k")
+data("pbmc3k.final")
+seurat_obj = pbmc3k.final
+seurat_obj[["external_label"]] = seurat_obj$seurat_annotations
+```
+
+# Cluster with external label
+```{r}
+p = DimPlot(seurat_obj, group.by = "external_label", label = TRUE)
+p
+```
+
+# Obtain Gaussian Kernel
+```{r}
+delta = 0.1
+kNN = 10
+nbEigenValues_spec = 50 # num of eigvals used to do spectral clustering
+nbEigenValues_diffuse = 100 # largest num of eigvals for diffusiondist
+# eigval_thred = 0.99
+
+dat = as.matrix(seurat_obj@reductions$pca@cell.embeddings)
+external_label = seurat_obj$external_label
+sim_mat = Build_Gaussian_kernel(data = dat, kNN = kNN)
+```
+
+# Clustering by different metric
+## Spectral Clustering
+```{r}
+spectral_cluster = Spectral_clustering(sim_mat, k = 9)
+Idents(seurat_obj) = spectral_cluster
+p1 = DimPlot(seurat_obj, label = TRUE) + ggtitle(sprintf("Spectral Clustering, ARI = %.2f",round(ARI(external_label, spectral_cluster),2))) + NoLegend()
+p1
+```
+
+## Hierarchical Clustering & K-medoids using Diffusion distance
+### Determine time-scale
+```{r}
+ari_h = NULL
+cl_h = NULL
+ari_k = NULL
+cl_k = NULL
+time_scale_ls = c(seq(1,10),seq(20,50,10))
+for(t in time_scale_ls){
+  cat(t,"\n")
+  diffuse_dist = Calculate_diffusiondist(sim_mat = sim_mat,
+                                       nbEigenValues = nbEigenValues_diffuse,
+                                       time_scale = t, delta = 0.1)
+  htree_res = Hierarchical_clustering(diffusion_dist = diffuse_dist,
+                                    k = 9)
+  cl_h = c(cl_h,list(htree_res$partition))
+  ari_h = c(ari_h,ARI(external_label,htree_res$partition))
+  
+  kmedoid_res = kmedoid_clustering(diffusion_dist = diffuse_dist,
+                                    k = 9)
+  cl_k = c(cl_k,list(kmedoid_res))
+  ari_k = c(ari_k,ARI(external_label,kmedoid_res))
+}
+```
+Plot ARI curve
+```{r}
+df = data.frame("time_scale" = time_scale_ls,"ARI_hclust" = ari_h, "ARI_kmedoid" = ari_k)
+df$time_scale = factor(df$time_scale,levels = unique(df$time_scale))
+df = reshape2::melt(df, id="time_scale") 
+colnames(df) = c("time_scale","method","ARI")
+
+ggplot(data=df, 
+       aes(x=time_scale, y=ARI,group = method,color = method)) + 
+  geom_line()+ geom_point()
+```
+
+### Hierachical Clustering
+```{r}
+t = min(which(ari_h == max(ari_h)))
+Idents(seurat_obj) = cl_h[[t]]
+p2 = DimPlot(seurat_obj, label = TRUE) + ggtitle(sprintf("Hierachical Clustering (t = %d), ARI = %.2f",t,round(ARI(external_label, cl_h[[t]]),2))) + NoLegend()
+p2
+```
+
+### K-medoids Clustering
+```{r}
+t = min(which(ari_k == max(ari_k)))
+Idents(seurat_obj) = cl_k[[t]]
+p2 = DimPlot(seurat_obj, label = TRUE) + ggtitle(sprintf("Hierachical Clustering (t = %d), ARI = %.2f",t,round(ARI(external_label, cl_k[[t]]),2))) + NoLegend()
+p2
+```
+
+
+# Spectral + K-medoids Clustering
+## Spectral Clustering
+### Define the number of clusters by eigenval decaying
+```{r}
+Vals = ncut(W = sim_mat, nbEigenValues = 50)[[2]]
+plot(Vals)
+abline(h = 0.98, col = "red")
+```
+
+Here we set cutoff at eigenVal = 0.98, i.e K = 4.
+
+### Performing spectral clustering to separate disconnected components apart
+```{r}
+spectral_cluster = Spectral_clustering(sim_mat, k = 4)
+Idents(seurat_obj) = spectral_cluster
+DimPlot(seurat_obj, label = TRUE) + ggtitle(paste0("Spectral Clustering, ARI = ",round(ARI(external_label, spectral_cluster),2))) + NoLegend()
+```
+
+## K-medoid on each subgroup
+### Determine t by twin sample cross-validation
+```{r}
+time_scale_ls = c(seq(1,10),seq(20,50,10))
+cl <- makeCluster(10)
+registerDoParallel(cl)
+res <- foreach(i = time_scale_ls, .packages = c("kmed", "aricode"), .combine = rbind) %dopar% {
+  res = unlist(lapply(names(table(spectral_cluster)), function(part){
+    subsample = which(spectral_cluster == part)
+    sim_mat_sub = sim_mat[subsample,subsample]
+    diffuse_dist = Calculate_diffusiondist(sim_mat = sim_mat_sub,
+                                       nbEigenValues = nbEigenValues_diffuse,
+                                       time_scale = i, delta = 0.1)
+    RI = unlist(lapply(1:10,function(seed){
+      Twin_sample_metric(diffuse_dist, seed = seed)
+    }) )
+    mean(RI)
+  }) )
+  
+  return(res)
+}
+stopCluster(cl)
+registerDoSEQ()
+```
+
+```{r}
+# Plot average Rand Idex curve
+df = data.frame(res)
+df$'time_scale' = time_scale_ls
+colnames(df)[1:4] = names(table(spectral_cluster))
+df = reshape2::melt(df,id = "time_scale")
+colnames(df) = c("time_scale","cluster","RI")
+
+df$time_scale = factor(df$time_scale,levels = unique(df$time_scale))
+ggplot(data=df, 
+       aes(x=time_scale, y=RI,group = cluster,color = cluster)) + 
+  geom_line()+ geom_point()
+```
+Here we choose t = 10.
+
+### Calculate the diffusion distance for each group
+```{r}
+t = 10
+dist_ls = lapply(names(table(spectral_cluster)), function(part){
+  subsample = which(spectral_cluster == part)
+  sim_mat_sub = sim_mat[subsample,subsample]
+  diffuse_dist = Calculate_diffusiondist(sim_mat = sim_mat_sub,
+                                   nbEigenValues = nbEigenValues_diffuse,
+                                   time_scale = t, delta = 0.1)
+  diffuse_dist
+})
+
+names(dist_ls) = names(table(spectral_cluster))
+```
+
+### k-medoid clustering for each group (given k)
+```{r}
+singleton = 10
+k = c(1,1,3,4)
+final_cluster = spectral_cluster
+
+for(i in 1:length(dist_ls)){
+  subsample = which(spectral_cluster == names(dist_ls)[i])
+  
+  # discard group w/ singleton
+  group_num = 1; k_ = k[i]
+  partition = NULL
+  while(group_num!=k[i]){
+    # partition = Hierarchical_clustering(dist_ls[[i]], k = k_)[[1]]
+    partition = kmedoid_clustering(dist_ls[[i]], k = k_)
+    group_num = sum(table(partition) > singleton)
+    k_ = k_ + 1
+  }
+  
+  final_cluster[subsample] = paste0(spectral_cluster[subsample],"-",partition)
+}
+```
+
+### Visualization
+```{r}
+final_cluster = as.character(final_cluster)
+# Remove singleton 
+singleton_group = names(table(final_cluster)[table(final_cluster) < singleton])
+final_cluster[final_cluster %in% singleton_group] = "Outlier"
+Idents(seurat_obj) = final_cluster
+p3 = DimPlot(seurat_obj, label = TRUE) + ggtitle(sprintf("K-medoid Clustering (t = %d), ARI = %.2f",t,round(ARI(external_label, Idents(seurat_obj)),2)))
+p3
+```
+
+
